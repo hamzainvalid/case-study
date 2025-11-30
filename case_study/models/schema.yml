@@ -1,0 +1,309 @@
+version: 2
+
+sources:
+  - name: raw
+    database: case-study-479614
+    schema: raw
+    tables:
+      - name: listing
+        columns:
+          - name: id
+            tests:
+              - not_null
+              - unique
+      - name: orders
+        columns:
+          - name: order_id
+            tests:
+              - not_null
+              - unique
+          - name: listing_id
+            tests:
+              - not_null
+      - name: orders_daily
+        columns:
+          - name: date
+            tests:
+              - not_null
+          - name: listing_id
+            tests:
+              - not_null
+      - name: org
+        columns:
+          - name: id
+            tests:
+              - not_null
+              - unique
+      - name: outlet
+        columns:
+          - name: id
+            tests:
+              - not_null
+              - unique
+          - name: org_id
+            tests:
+              - not_null
+      - name: platform
+        columns:
+          - name: id
+            tests:
+              - not_null
+              - unique
+      - name: rank
+        columns:
+          - name: listing_id
+            tests:
+              - not_null
+          - name: date
+            tests:
+              - not_null
+      - name: ratings_agg
+        columns:
+          - name: date
+            tests:
+              - not_null
+          - name: listing_id
+            tests:
+              - not_null
+      - name: weather
+        description: "Weather data fetched from Open-Meteo API via Airflow"
+        columns:
+          - name: outlet_id
+            tests:
+              - not_null
+          - name: timestamp
+            tests:
+              - not_null
+
+models:
+  - name: stg_listing
+    description: "Cleaned listing data with standardized column names"
+    columns:
+      - name: listing_id
+        description: "Primary key for listings"
+        tests:
+          - not_null
+          - unique
+      - name: outlet_id
+        description: "Foreign key to outlet"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_outlet')
+              field: outlet_id
+      - name: platform_id
+        description: "Foreign key to platform"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_platform')
+              field: platform_id
+
+  - name: stg_orders
+    description: "Cleaned orders with date parsing and status normalization"
+    columns:
+      - name: order_id
+        description: "Primary key for orders"
+        tests:
+          - not_null
+          - unique
+      - name: listing_id
+        description: "Foreign key to listing"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_listing')
+              field: listing_id
+      - name: status
+        description: "Order status"
+        tests:
+          - accepted_values:
+              values: ['completed', 'cancelled', 'pending', 'processing']
+              quote: false
+
+  - name: stg_orders_daily
+    description: "Cleaned daily order aggregates with deduplication"
+    columns:
+      - name: order_date
+        description: "Date of the order aggregation"
+        tests:
+          - not_null
+      - name: listing_id
+        description: "Foreign key to listing"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_listing')
+              field: listing_id
+      - name: daily_orders
+        description: "Aggregated order count for the day"
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+
+  - name: stg_outlet
+    description: "Cleaned outlet data with validated coordinates"
+    columns:
+      - name: outlet_id
+        description: "Primary key for outlets"
+        tests:
+          - not_null
+          - unique
+      - name: org_id
+        description: "Foreign key to organization"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_org')
+              field: org_id
+      - name: latitude
+        description: "Outlet latitude"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: -90
+              max_value: 90
+      - name: longitude
+        description: "Outlet longitude"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: -180
+              max_value: 180
+
+  - name: stg_ratings_agg
+    description: "Cleaned rating aggregations"
+    columns:
+      - name: average_rating
+        description: "Average rating value"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 5
+
+  - name: stg_org
+    description: "Cleaned organization master data"
+    columns:
+      - name: org_id
+        tests:
+          - not_null
+          - unique
+
+      - name: stg_platform
+        description: "Cleaned platform master data"
+        columns:
+          - name: platform_id
+            tests:
+              - not_null
+              - unique
+
+      - name: stg_order_daily
+        description: "Cleaned daily order aggregates"
+
+      - name: stg_rank
+        description: "Cleaned rank snapshots"
+
+      - name: stg_weather
+        description: "Cleaned hourly weather data"
+
+  - name: int_daily_orders
+    description: "Daily order metrics combining aggregated and actual orders"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - order_date
+            - listing_id
+    columns:
+      - name: order_date
+        tests:
+          - not_null
+      - name: listing_id
+        tests:
+          - not_null
+
+  - name: int_daily_ratings
+    description: "Daily rating metrics with cumulative and delta calculations"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - rating_date
+            - listing_id
+    columns:
+      - name: rating_date
+        tests:
+          - not_null
+      - name: listing_id
+        tests:
+          - not_null
+
+  - name: int_daily_rank
+    description: "Daily rank metrics aggregated from multiple snapshots"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - rank_date
+            - listing_id
+    columns:
+      - name: rank_date
+        tests:
+          - not_null
+      - name: listing_id
+        tests:
+          - not_null
+
+  - name: int_daily_weather
+    description: "Daily weather metrics aggregated from hourly readings"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - weather_date
+            - outlet_id
+    columns:
+      - name: weather_date
+        tests:
+          - not_null
+      - name: outlet_id
+        tests:
+          - not_null
+
+  - name: daily_reporting
+    description: "Daily performance reporting table combining all metrics"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - report_date
+            - listing_id
+    columns:
+      - name: report_date
+        description: "Date of the report"
+        tests:
+          - not_null
+      - name: listing_id
+        description: "Listing identifier"
+        tests:
+          - not_null
+      - name: outlet_id
+        description: "Outlet identifier"
+        tests:
+          - not_null
+      - name: platform_id
+        description: "Platform identifier"
+        tests:
+          - not_null
+      - name: completion_rate
+        description: "Percentage of orders completed"
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 1
+              inclusive: true
+              where: "completion_rate is not null"
+      - name: cumulative_average_rating
+        description: "Cumulative average rating"
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 5
+              inclusive: true
+              where: "cumulative_average_rating is not null"

@@ -1,0 +1,6 @@
+id,group,name,country
+1,Delivery,UberEats,US
+2,Delivery,DoorDash,US
+3,Delivery,Deliveroo,UK
+4,Aggregator,JustEat,UK
+5,Aggregator,GrubHub,US
