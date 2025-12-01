@@ -1,15 +1,8 @@
-# dags/fetch_weather_data.py
-"""
-Airflow DAG to fetch weather data from Open-Meteo API
-and load it into BigQuery raw.weather table
-"""
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
 import requests
 import pandas as pd
-from typing import List, Dict
 from google.cloud import bigquery
 
 default_args = {
@@ -22,38 +15,68 @@ default_args = {
 }
 
 
-def fetch_outlets_from_bigquery(**context):
+def get_date_range_from_data(**context):
     """
-    Fetch outlet coordinates from BigQuery
-    Returns list of dicts with outlet_id, latitude, longitude
+    Get the min and max dates from existing business data
     """
     client = bigquery.Client()
 
     query = """
-          SELECT id as outlet_id, latitude, longitude 
-          FROM `case-study-479614.raw.outlet`
-          WHERE latitude IS NOT NULL 
-            AND longitude IS NOT NULL
-      """
+        SELECT 
+            MIN(date_value) as min_date,
+            MAX(date_value) as max_date
+        FROM (
+            SELECT DATE(placed_at) as date_value FROM `case-study-479614.raw.orders`
+            UNION ALL
+            SELECT PARSE_DATE('%Y-%m-%d', date) as date_value FROM `case-study-479614.raw.orders_daily`
+            UNION ALL
+            SELECT PARSE_DATE('%Y-%m-%d', date) as date_value FROM `case-study-479614.raw.rank`
+            UNION ALL
+            SELECT PARSE_DATE('%Y-%m-%d', date) as date_value FROM `case-study-479614.raw.ratings_agg`
+        )
+        """
+
+    df = client.query(query).to_dataframe()
+    min_date = df['min_date'].iloc[0]
+    max_date = df['max_date'].iloc[0]
+
+    context['ti'].xcom_push(key='min_date', value=min_date.strftime('%Y-%m-%d'))
+    context['ti'].xcom_push(key='max_date', value=max_date.strftime('%Y-%m-%d'))
+
+    print(f"Data range: {min_date} to {max_date}")
+    return f"{min_date} to {max_date}"
+
+
+def fetch_outlets_from_bigquery(**context):
+    """
+    Fetch outlet coordinates from BigQuery
+    """
+    client = bigquery.Client()
+
+    query = """
+        SELECT id as outlet_id, latitude, longitude 
+        FROM `case-study-479614.raw.outlet`
+        WHERE latitude IS NOT NULL 
+          AND longitude IS NOT NULL
+    """
 
     df = client.query(query).to_dataframe()
     outlets = df.to_dict('records')
 
-    # Push to XCom for next task
     context['ti'].xcom_push(key='outlets', value=outlets)
     print(f"Fetched {len(outlets)} outlets from BigQuery")
     return len(outlets)
 
 
-def fetch_weather_data_from_api(**context):
+def fetch_historical_weather_data(**context):
     """
-    Fetch hourly weather data from Open-Meteo API
+    Fetch hourly weather data for the full historical date range
     """
     outlets = context['ti'].xcom_pull(key='outlets', task_ids='fetch_outlets')
-    execution_date = context['execution_date']
+    min_date = context['ti'].xcom_pull(key='min_date', task_ids='get_date_range')
+    max_date = context['ti'].xcom_pull(key='max_date', task_ids='get_date_range')
 
-    # Fetch for the previous day
-    date_str = (execution_date - timedelta(days=1)).strftime('%Y-%m-%d')
+    print(f"Fetching weather data from {min_date} to {max_date}")
 
     all_weather_data = []
 
@@ -62,24 +85,22 @@ def fetch_weather_data_from_api(**context):
         longitude = outlet['longitude']
         outlet_id = outlet['outlet_id']
 
-        # Open-Meteo API endpoint
         url = "https://archive-api.open-meteo.com/v1/archive"
 
         params = {
             'latitude': latitude,
             'longitude': longitude,
-            'start_date': date_str,
-            'end_date': date_str,
+            'start_date': min_date,
+            'end_date': max_date,
             'hourly': 'temperature_2m,relative_humidity_2m,wind_speed_10m',
             'timezone': 'UTC'
         }
 
         try:
-            response = requests.get(url, params=params, timeout=30)
+            response = requests.get(url, params=params, timeout=60)
             response.raise_for_status()
             data = response.json()
 
-            # Parse hourly data
             if 'hourly' in data:
                 hourly = data['hourly']
                 timestamps = hourly.get('time', [])
@@ -100,24 +121,20 @@ def fetch_weather_data_from_api(**context):
             print(f"Error fetching weather for outlet {outlet_id}: {e}")
             continue
 
-    # Convert to DataFrame with explicit types
     df = pd.DataFrame(all_weather_data)
 
-    # Ensure correct data types to match BigQuery schema
     df['outlet_id'] = df['outlet_id'].astype('Int64')
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df['temperature_2m'] = df['temperature_2m'].astype('float64')
     df['relative_humidity_2m'] = df['relative_humidity_2m'].astype('float64')
     df['wind_speed_10m'] = df['wind_speed_10m'].astype('float64')
 
-    # Save to temporary GCS location for BigQuery load
-    # Use engine='pyarrow' and specify timestamp resolution
-    gcs_path = f'gs://us-central1-casestudy1-68940b42-bucket/weather_data/{date_str}/weather.parquet'
+    gcs_path = f'gs://us-central1-casestudy1-68940b42-bucket/weather_data/historical/weather_{min_date}_{max_date}.parquet'
     df.to_parquet(
         gcs_path,
         index=False,
         engine='pyarrow',
-        coerce_timestamps='ms',  # Use milliseconds instead of nanoseconds
+        coerce_timestamps='ms',
         allow_truncated_timestamps=True
     )
 
@@ -140,7 +157,6 @@ def load_weather_to_bigquery(**context):
         return 0
 
     client = bigquery.Client()
-
     table_id = "case-study-479614.raw.weather"
 
     job_config = bigquery.LoadJobConfig(
@@ -155,27 +171,27 @@ def load_weather_to_bigquery(**context):
         ]
     )
 
-    load_job = client.load_table_from_uri(
-        gcs_path,
-        table_id,
-        job_config=job_config
-    )
-
-    load_job.result()  # Wait for job to complete
+    load_job = client.load_table_from_uri(gcs_path, table_id, job_config=job_config)
+    load_job.result()
 
     print(f"Loaded {record_count} rows into {table_id}")
     return record_count
 
 
 with DAG(
-        'fetch_weather_data',
+        'fetch_weather_historical_backfill',
         default_args=default_args,
-        description='Fetch hourly weather data from Open-Meteo API and load to BigQuery',
-        schedule_interval='0 2 * * *',  # Run daily at 2 AM UTC
+        description='One-time backfill of historical weather data',
+        schedule_interval=None,
         start_date=datetime(2024, 1, 1),
         catchup=False,
-        tags=['weather', 'etl', 'bigquery'],
+        tags=['weather', 'backfill', 'bigquery'],
 ) as dag:
+    get_dates = PythonOperator(
+        task_id='get_date_range',
+        python_callable=get_date_range_from_data,
+    )
+
     fetch_outlets = PythonOperator(
         task_id='fetch_outlets',
         python_callable=fetch_outlets_from_bigquery,
@@ -183,7 +199,8 @@ with DAG(
 
     fetch_weather = PythonOperator(
         task_id='fetch_weather_api',
-        python_callable=fetch_weather_data_from_api,
+        python_callable=fetch_historical_weather_data,
+        execution_timeout=timedelta(minutes=30),
     )
 
     load_weather = PythonOperator(
@@ -191,16 +208,4 @@ with DAG(
         python_callable=load_weather_to_bigquery,
     )
 
-    # Trigger dbt run after loading
-    # trigger_dbt = BigQueryInsertJobOperator(
-    #     task_id='trigger_dbt_run',
-    #     configuration={
-    #         "query": {
-    #             "query": "SELECT 1",  # Placeholder - replace with actual dbt trigger
-    #             "useLegacySql": False,
-    #         }
-    #     },
-    #     gcp_conn_id='google_cloud_default',
-    # )
-
-    fetch_outlets >> fetch_weather >> load_weather
+    get_dates >> fetch_outlets >> fetch_weather >> load_weather

@@ -120,6 +120,7 @@ final as (
         w.max_wind_speed,
         w.avg_humidity,
         w.max_humidity,
+        w.weather_reading_count,
 
         -- Calculated business metrics
         case
@@ -136,12 +137,14 @@ final as (
         end as order_volume_tier,
 
         case
+            when w.avg_temperature is null then 'No Data'
             when w.avg_temperature < 10 then 'Cold'
             when w.avg_temperature < 25 then 'Moderate'
             else 'Hot'
         end as temperature_category,
 
         case
+            when w.avg_wind_speed is null then 'No Data'
             when w.avg_wind_speed < 10 then 'Calm'
             when w.avg_wind_speed < 30 then 'Moderate Wind'
             else 'Strong Wind'
